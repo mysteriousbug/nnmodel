@@ -7,7 +7,7 @@ header = st.container()
 with header:
     col4,col5,col6= st.columns([1,1,4])
     with col4:
-        st.image("images/newl.jpeg")
+        st.image("images/logo.png")
 
 st.header("Live Code Translation")
 
