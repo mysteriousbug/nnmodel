@@ -1,5 +1,6 @@
 import streamlit as st
 from prompt import translate_code
+from PIL import Image
 
 st.set_page_config(layout="wide")
 
@@ -7,7 +8,8 @@ header = st.container()
 with header:
     col4,col5,col6= st.columns([1,1,4])
     with col4:
-        st.image("logo.png")
+        img = Image.open("logo.png")
+        st.image(img)
 
 st.header("Live Code Translation")
 
