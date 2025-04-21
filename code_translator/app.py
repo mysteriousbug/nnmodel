@@ -1,5 +1,5 @@
 import streamlit as st
-from code_translator.prompt import translate_code
+from prompt import translate_code
 
 st.set_page_config(layout="wide")
 
