@@ -55,7 +55,7 @@ with col1:
                     st.error(f"Translation error: {str(e)}")
 with col2:
     st.header("Translated Code")
-    output_language = st.selectbox("Select Target Language", ["Java", "C++", "Python"])
+    output_language = st.selectbox("Select Target Language", ["Java", "C++"])
     
     if flag ==1:
         # Display translated code
