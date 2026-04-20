@@ -277,23 +277,74 @@ test6 = pd.DataFrame(per_prod_rows)
 
 
 # ---------------------------------------------------------------------------
-# Write output
+# Diagnostics — join cardinality (helps spot runaway fan-out)
 # ---------------------------------------------------------------------------
+match_per_product = (joined.groupby("_join_key")[t_number]
+                     .apply(lambda s: s.notna().sum()))
+diag = pd.DataFrame({
+    "metric": [
+        "product_rows",
+        "ticket_rows",
+        "joined_rows",
+        "products_with_at_least_1_ticket_match",
+        "products_with_0_ticket_matches",
+        "max_tickets_matched_to_one_product",
+        "mean_tickets_per_matched_product",
+    ],
+    "value": [
+        len(products),
+        len(tickets),
+        len(joined),
+        int((match_per_product > 0).sum()),
+        int((match_per_product == 0).sum()),
+        int(match_per_product.max()) if len(match_per_product) else 0,
+        float(match_per_product[match_per_product > 0].mean())
+            if (match_per_product > 0).any() else 0.0,
+    ],
+})
+print("\nJoin diagnostics:")
+print(diag.to_string(index=False))
+
+# ---------------------------------------------------------------------------
+# Write output
+#
+# The joined frame exceeds Excel's 1,048,576-row limit, so:
+#   - full joined data -> CSV (unbounded)
+#   - Excel workbook -> all aggregate tests + a capped preview of joined data
+# ---------------------------------------------------------------------------
+joined_export = joined.drop(columns=["_join_key"])
+JOINED_CSV = OUTPUT_FILE.replace(".xlsx", "_joined_full.csv")
+
+print(f"\nWriting full joined data -> {JOINED_CSV} ({len(joined_export):,} rows)...")
+joined_export.to_csv(JOINED_CSV, index=False)
+
+EXCEL_ROW_LIMIT = 1_048_575  # minus header row
+preview = joined_export.head(EXCEL_ROW_LIMIT)
+
 print(f"Writing {OUTPUT_FILE}...")
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as xw:
-    # Drop the internal join key before exporting
-    joined.drop(columns=["_join_key"]).to_excel(
-        xw, sheet_name="joined_data", index=False)
+    # Aggregate results first (these are what you actually analyse)
+    diag.to_excel(xw,  sheet_name="0_join_diagnostics", index=False)
     test1.to_excel(xw, sheet_name="1_aging_x_CTDR_TDR", index=False)
-    test2.to_excel(xw, sheet_name="2_total_tickets",   index=False)
-    test3.to_excel(xw, sheet_name="3_by_impact",       index=False)
-    test4.to_excel(xw, sheet_name="4_monthly_avg",     index=False)
+    test2.to_excel(xw, sheet_name="2_total_tickets",    index=False)
+    test3.to_excel(xw, sheet_name="3_by_impact",        index=False)
+    test4.to_excel(xw, sheet_name="4_monthly_avg",      index=False)
     test5.to_excel(xw, sheet_name="5_monthly_by_impact", index=False)
-    test6.to_excel(xw, sheet_name="6_per_product_eos", index=False)
+    test6.to_excel(xw, sheet_name="6_per_product_eos",  index=False)
 
-    # Detail sheets for the per-product monthly rates
+    # Per-product rate detail
     pre_all.to_excel(xw,  sheet_name="detail_pre_EOS_rates",  index=False)
     post_all.to_excel(xw, sheet_name="detail_post_EOS_rates", index=False)
 
-print("Done.")
-print(f"\nOpen {OUTPUT_FILE} to inspect results, then run the Streamlit app.")
+    # Joined-data preview last (capped at Excel's row limit)
+    preview.to_excel(xw, sheet_name="joined_data_preview", index=False)
+    if len(joined_export) > len(preview):
+        pd.DataFrame({"note": [
+            f"joined_data_preview shows the first {len(preview):,} rows.",
+            f"Full {len(joined_export):,} rows are in {JOINED_CSV}.",
+        ]}).to_excel(xw, sheet_name="_README", index=False)
+
+print("\nDone.")
+print(f"  Excel:       {OUTPUT_FILE}")
+print(f"  Full joined: {JOINED_CSV}")
+print("Run the dashboard with:  streamlit run app.py")
