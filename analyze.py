@@ -1,17 +1,22 @@
 """
-Product List x Problem Tickets — Join & Analysis
-=================================================
-Join:  product_list.Application Service  ==  problem_tickets.Configuration Item
-Output: analysis_output.xlsx  (multi-sheet)
+Product List x Problem Tickets - Analysis
+==========================================
+Matched to refined schemas.
+
+Product list columns used:
+    Application Service, Product EOS Date Status, Is In CTDR-Output,
+    Is In TDR, Product Name
+
+Problem tickets columns used:
+    number, sys_created_on, closed_at, cmdb_ci, priority, impact
 
 Run:
-    pip install pandas numpy openpyxl python-dateutil
+    pip install pandas numpy openpyxl
     python analyze.py
 """
 
 from __future__ import annotations
-import sys
-from pathlib import Path
+import re
 from datetime import datetime
 import numpy as np
 import pandas as pd
@@ -19,37 +24,86 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-PRODUCT_FILE  = "product_list_input.xlsx"
-TICKETS_FILE  = "problem_tickets.xlsx"
-OUTPUT_FILE   = "analysis_output.xlsx"
-TODAY         = pd.Timestamp(datetime.now().date())
+PRODUCT_FILE = "product_list_input.xlsx"
+TICKETS_FILE = "problem_tickets.xlsx"
+OUTPUT_FILE  = "analysis_output.xlsx"
+TODAY        = pd.Timestamp(datetime.now().date())
+
+PRODUCT_COLS = [
+    "Application Service",
+    "Product EOS Date Status",
+    "Is In CTDR-Output",
+    "Is In TDR",
+    "Product Name",
+]
+TICKET_COLS = [
+    "number",
+    "sys_created_on",
+    "closed_at",
+    "cmdb_ci",
+    "priority",
+    "impact",
+]
 
 AGING_BUCKETS = [(0, 30, "0-30"), (31, 60, "31-60"),
                  (61, 90, "61-90"), (91, np.inf, "90+")]
 
+IMPACT_LEVELS = [2, 3, 4, 5]   # actual values present in this dataset
+
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Date parsing
 # ---------------------------------------------------------------------------
-def find_col(df: pd.DataFrame, *candidates: str) -> str | None:
-    """Return the first column in df whose name matches any candidate
-    (case/whitespace/underscore-insensitive). None if nothing matches."""
-    norm = {c.lower().replace(" ", "").replace("_", ""): c for c in df.columns}
-    for cand in candidates:
-        key = cand.lower().replace(" ", "").replace("_", "")
-        if key in norm:
-            return norm[key]
-    return None
+def parse_dmy(val):
+    """Parse product EOS date: dd/mm/yyyy (sometimes with single-digit day/month)."""
+    if pd.isna(val):
+        return pd.NaT
+    if isinstance(val, (pd.Timestamp, datetime)):
+        # Excel may already have given us a real datetime - trust it.
+        return pd.Timestamp(val)
+    s = str(val).strip()
+    if not s:
+        return pd.NaT
+    return pd.to_datetime(s, dayfirst=True, errors="coerce")
 
 
-def require(col: str | None, label: str, df_name: str) -> str:
-    if col is None:
-        sys.exit(f"[FATAL] Could not find '{label}' column in {df_name}. "
-                 f"Columns present: {list(col for col in [])}")
-    return col
+# Matches e.g. "15-07-2024 06:28:20" (dd-mm-yyyy) vs "12/6/2024 10:37:11 PM" (mm/dd/yyyy)
+_DASH_DMY = re.compile(r"^\s*\d{1,2}-\d{1,2}-\d{4}")
 
 
-def bucket_age(days: float) -> str:
+def parse_ticket_ts(val):
+    """Parse ticket timestamps with mixed formats:
+       - 'dd-mm-yyyy HH:MM:SS'            (dash-separated -> dayfirst)
+       - 'mm/dd/yyyy HH:MM:SS AM/PM'      (slash-separated -> monthfirst)
+    """
+    if pd.isna(val):
+        return pd.NaT
+    if isinstance(val, (pd.Timestamp, datetime)):
+        return pd.Timestamp(val)
+    s = str(val).strip()
+    if not s:
+        return pd.NaT
+    dayfirst = bool(_DASH_DMY.match(s))
+    return pd.to_datetime(s, dayfirst=dayfirst, errors="coerce")
+
+
+def parse_impact(val):
+    """Impact arrives as '5 - No Impact / Single User' etc. Extract the leading int."""
+    if pd.isna(val):
+        return np.nan
+    s = str(val).strip()
+    m = re.match(r"\s*(\d+)", s)
+    return int(m.group(1)) if m else np.nan
+
+
+def yn(val):
+    """Yes or blank -> Yes / No."""
+    if pd.isna(val):
+        return "No"
+    return "Yes" if str(val).strip().lower() == "yes" else "No"
+
+
+def bucket_age(days):
     if pd.isna(days) or days < 0:
         return "Unknown"
     for lo, hi, label in AGING_BUCKETS:
@@ -58,131 +112,154 @@ def bucket_age(days: float) -> str:
     return "Unknown"
 
 
-def months_between(a: pd.Timestamp, b: pd.Timestamp) -> float:
-    """Signed month count between two timestamps (b - a)."""
-    if pd.isna(a) or pd.isna(b):
-        return np.nan
-    return (b - a).days / 30.4375
+def safe_read_excel(path, wanted):
+    header = pd.read_excel(path, nrows=0)
+    present = [c for c in wanted if c in header.columns]
+    missing = [c for c in wanted if c not in header.columns]
+    if missing:
+        print(f"  [WARN] Missing in {path}: {missing}")
+    return pd.read_excel(path, usecols=present)
 
 
 # ---------------------------------------------------------------------------
 # Load
 # ---------------------------------------------------------------------------
 print("Loading files...")
-products = pd.read_excel(PRODUCT_FILE)
-tickets  = pd.read_excel(TICKETS_FILE)
+products = safe_read_excel(PRODUCT_FILE, PRODUCT_COLS)
+tickets  = safe_read_excel(TICKETS_FILE, TICKET_COLS)
 print(f"  products: {products.shape}")
 print(f"  tickets:  {tickets.shape}")
 
-# Column resolution ----------------------------------------------------------
-p_app_svc  = find_col(products, "Application Service")
-p_eos      = find_col(products, "Product EOES Date", "Product EOS Date",
-                      "Product EOS")
-p_ctdr_out = find_col(products, "Is In CTDR-Output", "Is In CTDR Output")
-p_tdr      = find_col(products, "Is In TDR")
-p_name     = find_col(products, "Name With Serial Number", "Name")
+# --- Product transforms ---
+products["eos_date"] = products["Product EOS Date Status"].apply(parse_dmy)
+products["_ctdr"]    = products["Is In CTDR-Output"].apply(yn)
+products["_tdr"]     = products["Is In TDR"].apply(yn)
+products["_key"]     = (products["Application Service"].astype(str)
+                        .str.strip().str.casefold())
 
-t_ci       = find_col(tickets, "Configuration Item", "cmdb_ci",
-                      "u_configuration_item", "business_service")
-t_start    = find_col(tickets, "work_start", "sys_created_on", "opened_at")
-t_impact   = find_col(tickets, "impact")
-t_number   = find_col(tickets, "number")
+n_bad_eos = products["eos_date"].isna().sum() - products["Product EOS Date Status"].isna().sum()
+if n_bad_eos > 0:
+    print(f"  [WARN] {n_bad_eos} product rows had unparseable EOS dates.")
 
-for col, label, dfname in [
-    (p_app_svc,  "Application Service", "product_list"),
-    (p_eos,      "Product EOS/EOES Date", "product_list"),
-    (t_ci,       "Configuration Item", "problem_tickets"),
-    (t_start,    "work_start", "problem_tickets"),
-    (t_impact,   "impact", "problem_tickets"),
-    (t_number,   "number", "problem_tickets"),
-]:
-    if col is None:
-        print(f"[WARN] '{label}' not found in {dfname}")
+# --- Ticket transforms ---
+tickets["created"] = tickets["sys_created_on"].apply(parse_ticket_ts)
+tickets["closed"]  = tickets["closed_at"].apply(parse_ticket_ts)
+tickets["impact_int"] = tickets["impact"].apply(parse_impact)
+tickets["_key"]    = (tickets["cmdb_ci"].astype(str)
+                      .str.strip().str.casefold())
 
-# Type coercion --------------------------------------------------------------
-products[p_eos]  = pd.to_datetime(products[p_eos], errors="coerce")
-tickets[t_start] = pd.to_datetime(tickets[t_start], errors="coerce")
-tickets[t_impact] = pd.to_numeric(tickets[t_impact], errors="coerce")
-
-# Normalise join keys (strip/casefold to reduce false mismatches) ------------
-products["_join_key"] = (products[p_app_svc].astype(str)
-                         .str.strip().str.casefold())
-tickets["_join_key"]  = (tickets[t_ci].astype(str)
-                         .str.strip().str.casefold())
-
-# ---------------------------------------------------------------------------
-# Join  (left: product → tickets)
-# ---------------------------------------------------------------------------
-print("Joining...")
-joined = products.merge(tickets, on="_join_key", how="left",
-                        suffixes=("_prod", "_tkt"))
-print(f"  joined rows: {len(joined)}")
-
-# Derive helpers on joined frame --------------------------------------------
-joined["age_days"]  = (TODAY - joined[t_start]).dt.days
-joined["age_bucket"] = joined["age_days"].apply(bucket_age)
-joined["months_from_eos"] = joined.apply(
-    lambda r: months_between(r[p_eos], r[t_start]), axis=1)
-# negative => ticket before EOS, positive => after EOS
+n_bad_created = tickets["created"].isna().sum() - tickets["sys_created_on"].isna().sum()
+if n_bad_created > 0:
+    print(f"  [WARN] {n_bad_created} ticket rows had unparseable sys_created_on.")
 
 
 # ---------------------------------------------------------------------------
-# Test 1 — Aging buckets × CTDR-Output vs TDR
+# Aggregate products per service (prevents fan-out).
+# If multiple products share a service, we use the EARLIEST EOS as the
+# service's EOS - conservative choice: the service is "exposed" from the
+# moment any of its products goes EOS.
 # ---------------------------------------------------------------------------
-def yn(val) -> str:
-    """Normalise flags (True/'Yes'/1 → 'Yes') for pivoting."""
-    if pd.isna(val):
-        return "No"
-    s = str(val).strip().lower()
-    return "Yes" if s in {"yes", "true", "1", "y"} else "No"
-
-
-has_ticket = joined[t_number].notna()
-t1_src = joined[has_ticket].copy()
-t1_src["CTDR-Output"] = t1_src[p_ctdr_out].apply(yn) if p_ctdr_out else "Unknown"
-t1_src["TDR"]         = t1_src[p_tdr].apply(yn)     if p_tdr     else "Unknown"
-
-test1 = (t1_src.groupby(["age_bucket", "CTDR-Output", "TDR"])
-         .size().reset_index(name="ticket_count"))
+print("Aggregating products per Application Service...")
+svc = (products.groupby("_key", as_index=False)
+       .agg(application_service=("Application Service", "first"),
+            earliest_eos=("eos_date", "min"),
+            latest_eos  =("eos_date", "max"),
+            product_rows=("_key", "size"),
+            any_ctdr=("_ctdr", lambda s: "Yes" if (s == "Yes").any() else "No"),
+            any_tdr =("_tdr",  lambda s: "Yes" if (s == "Yes").any() else "No"),
+            product_name_sample=("Product Name", "first")))
+print(f"  unique services: {len(svc)}")
 
 
 # ---------------------------------------------------------------------------
-# Test 2 — Total tickets  (unique ticket numbers)
+# Join tickets -> services
+# ---------------------------------------------------------------------------
+print("Joining tickets to services...")
+jt = tickets.merge(svc, on="_key", how="left")
+jt["has_product_match"] = jt["product_rows"].notna()
+jt["age_days"]   = (TODAY - jt["created"]).dt.days
+jt["age_bucket"] = jt["age_days"].apply(bucket_age)
+print(f"  ticket rows: {len(jt)}  "
+      f"(matched: {int(jt['has_product_match'].sum())}, "
+      f"unmatched: {int((~jt['has_product_match']).sum())})")
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+diag = pd.DataFrame({
+    "metric": [
+        "product_rows_loaded",
+        "unique_application_services",
+        "services_with_eos_date",
+        "ticket_rows_loaded",
+        "tickets_with_valid_created_date",
+        "tickets_matching_a_service",
+        "tickets_unmatched",
+        "max_product_rows_behind_one_service",
+        "mean_product_rows_per_service",
+    ],
+    "value": [
+        len(products),
+        len(svc),
+        int(svc["earliest_eos"].notna().sum()),
+        len(tickets),
+        int(tickets["created"].notna().sum()),
+        int(jt["has_product_match"].sum()),
+        int((~jt["has_product_match"]).sum()),
+        int(svc["product_rows"].max()) if len(svc) else 0,
+        float(svc["product_rows"].mean()) if len(svc) else 0.0,
+    ],
+})
+print("\nDiagnostics:")
+print(diag.to_string(index=False))
+
+
+# ---------------------------------------------------------------------------
+# Test 1 - Aging x CTDR-Output vs TDR (matched tickets only)
+# ---------------------------------------------------------------------------
+matched = jt[jt["has_product_match"]].copy()
+order = ["0-30", "31-60", "61-90", "90+", "Unknown"]
+matched["age_bucket"] = pd.Categorical(matched["age_bucket"],
+                                        categories=order, ordered=True)
+
+test1 = (matched.groupby(["age_bucket", "any_ctdr", "any_tdr"],
+                          observed=False)
+         .size().reset_index(name="ticket_count")
+         .rename(columns={"any_ctdr": "CTDR-Output", "any_tdr": "TDR"}))
+
+
+# ---------------------------------------------------------------------------
+# Test 2 - Totals
 # ---------------------------------------------------------------------------
 test2 = pd.DataFrame({
-    "metric": ["total_tickets_joined_rows",
-               "total_unique_tickets_in_source",
-               "unique_tickets_matching_a_product"],
-    "value":  [int(has_ticket.sum()),
-               int(tickets[t_number].nunique()),
-               int(joined.loc[has_ticket, t_number].nunique())],
+    "metric": ["total_tickets_in_source",
+               "tickets_matched_to_service",
+               "tickets_unmatched",
+               "unique_services_with_tickets"],
+    "value": [len(tickets),
+              int(jt["has_product_match"].sum()),
+              int((~jt["has_product_match"]).sum()),
+              int(matched["_key"].nunique())],
 })
 
 
 # ---------------------------------------------------------------------------
-# Test 3 — Tickets by impact 1..4
+# Test 3 - By impact level (2..5)
 # ---------------------------------------------------------------------------
-imp_src = joined[has_ticket].copy()
-imp_src["impact_clean"] = imp_src[t_impact].where(
-    imp_src[t_impact].isin([1, 2, 3, 4]), other=np.nan)
-test3 = (imp_src.dropna(subset=["impact_clean"])
-         .groupby("impact_clean").size()
-         .reindex([1, 2, 3, 4], fill_value=0)
-         .reset_index(name="ticket_count")
-         .rename(columns={"impact_clean": "impact"}))
+impact_counts = (matched["impact_int"]
+                 .value_counts()
+                 .reindex(IMPACT_LEVELS, fill_value=0))
+test3 = pd.DataFrame({"impact": IMPACT_LEVELS,
+                      "ticket_count": impact_counts.values})
 
 
 # ---------------------------------------------------------------------------
-# Test 4 & 5 — Monthly avg tickets in 6 months BEFORE EOS (overall + by impact)
-#
-# Methodology: for each product, exposure window in the pre-EOS 6-month band
-# is capped by today (if EOS is in the future we haven't observed all 6 mo yet).
-# Monthly rate per product = tickets_in_window / months_observed.
-# Report cross-product mean of that rate.
+# Tests 4 & 5 - Monthly averages pre/post EOS
+# Per service: window bounded by today so future EOS dates don't get
+# credited months they haven't lived.
 # ---------------------------------------------------------------------------
-def pre_eos_window(eos: pd.Timestamp):
-    """Return (start, end, months_observed) for the 6-mo pre-EOS window,
-    capped so we never count future time."""
+def pre_eos_window(eos):
     if pd.isna(eos):
         return None, None, 0.0
     start = eos - pd.DateOffset(months=6)
@@ -192,159 +269,116 @@ def pre_eos_window(eos: pd.Timestamp):
     return start, end, (end - start).days / 30.4375
 
 
-def post_eos_window(eos: pd.Timestamp):
-    """EOS → today."""
+def post_eos_window(eos):
     if pd.isna(eos) or eos >= TODAY:
         return None, None, 0.0
     return eos, TODAY, (TODAY - eos).days / 30.4375
 
 
-def monthly_rates(window_fn, impact_filter=None) -> pd.DataFrame:
-    """For each product compute tickets-in-window / months_observed."""
+def rates(window_fn, impact_filter=None):
     rows = []
-    grp = joined.groupby([p_app_svc, p_eos], dropna=False)
-    for (svc, eos), g in grp:
-        start, end, months = window_fn(eos)
+    by_svc = {k: g for k, g in matched.groupby("_key")}
+    for _, row in svc.iterrows():
+        start, end, months = window_fn(row["earliest_eos"])
         if months <= 0:
             continue
-        g_tickets = g[g[t_number].notna() & g[t_start].between(start, end)]
-        if impact_filter is not None:
-            g_tickets = g_tickets[g_tickets[t_impact] == impact_filter]
+        g = by_svc.get(row["_key"])
+        if g is None or g.empty:
+            tk = 0
+        else:
+            mask = g["created"].between(start, end)
+            if impact_filter is not None:
+                mask &= (g["impact_int"] == impact_filter)
+            tk = int(mask.sum())
         rows.append({
-            p_app_svc: svc,
-            "eos_date": eos,
+            "application_service": row["application_service"],
+            "eos_date": row["earliest_eos"],
             "window_start": start,
             "window_end": end,
             "months_observed": round(months, 2),
-            "tickets": len(g_tickets),
-            "monthly_rate": len(g_tickets) / months,
+            "tickets": tk,
+            "monthly_rate": tk / months,
         })
     return pd.DataFrame(rows)
 
 
-pre_all  = monthly_rates(pre_eos_window)
-post_all = monthly_rates(post_eos_window)
+print("Computing pre/post EOS monthly rates...")
+pre_all  = rates(pre_eos_window)
+post_all = rates(post_eos_window)
 
-test4 = pd.DataFrame({
-    "window": ["6 months BEFORE EOS", "AFTER EOS"],
-    "products_with_window": [len(pre_all), len(post_all)],
-    "mean_monthly_rate":    [pre_all["monthly_rate"].mean() if len(pre_all) else 0,
-                              post_all["monthly_rate"].mean() if len(post_all) else 0],
-    "median_monthly_rate":  [pre_all["monthly_rate"].median() if len(pre_all) else 0,
-                              post_all["monthly_rate"].median() if len(post_all) else 0],
-    "total_tickets_in_window": [pre_all["tickets"].sum() if len(pre_all) else 0,
-                                 post_all["tickets"].sum() if len(post_all) else 0],
-})
 
-# Test 5 — same but broken out by impact 1..4
-impact_rows = []
-for window_label, window_fn in [("pre_EOS_6mo", pre_eos_window),
-                                ("post_EOS",    post_eos_window)]:
-    for imp in [1, 2, 3, 4]:
-        df = monthly_rates(window_fn, impact_filter=imp)
-        impact_rows.append({
-            "window": window_label,
-            "impact": imp,
-            "products_with_window": len(df),
+def summarise(df, label):
+    if df.empty:
+        return {"window": label, "services_with_window": 0,
+                "mean_monthly_rate": 0, "median_monthly_rate": 0,
+                "total_tickets_in_window": 0}
+    return {"window": label,
+            "services_with_window": len(df),
+            "mean_monthly_rate":   df["monthly_rate"].mean(),
+            "median_monthly_rate": df["monthly_rate"].median(),
+            "total_tickets_in_window": int(df["tickets"].sum())}
+
+
+test4 = pd.DataFrame([summarise(pre_all,  "6 months BEFORE EOS"),
+                      summarise(post_all, "AFTER EOS")])
+
+rows5 = []
+for label, fn in [("pre_EOS_6mo", pre_eos_window),
+                  ("post_EOS",    post_eos_window)]:
+    for i in IMPACT_LEVELS:
+        df = rates(fn, impact_filter=i)
+        rows5.append({
+            "window": label, "impact": i,
+            "services_with_window": len(df),
             "mean_monthly_rate":   df["monthly_rate"].mean()   if len(df) else 0,
             "median_monthly_rate": df["monthly_rate"].median() if len(df) else 0,
             "total_tickets": int(df["tickets"].sum())           if len(df) else 0,
         })
-test5 = pd.DataFrame(impact_rows)
+test5 = pd.DataFrame(rows5)
 
 
 # ---------------------------------------------------------------------------
-# Test 6 — Per-product EOS aging × frequency × severity
-# Severity proxy: mean impact (lower = more severe in ServiceNow).
+# Test 6 - Per-service EOS aging x frequency x severity
+# Severity proxy = mean impact (lower = more severe in ServiceNow).
 # ---------------------------------------------------------------------------
-per_prod_rows = []
-for (svc, eos), g in joined.groupby([p_app_svc, p_eos], dropna=False):
-    g_t = g[g[t_number].notna()]
-    eos_age_days = (TODAY - eos).days if pd.notna(eos) else np.nan
-    per_prod_rows.append({
-        p_app_svc: svc,
+per_rows = []
+by_svc = {k: g for k, g in matched.groupby("_key")}
+for _, row in svc.iterrows():
+    g = by_svc.get(row["_key"], pd.DataFrame())
+    eos = row["earliest_eos"]
+    per_rows.append({
+        "application_service": row["application_service"],
+        "product_name_sample": row["product_name_sample"],
         "eos_date": eos,
-        "days_since_eos": eos_age_days,
+        "days_since_eos": (TODAY - eos).days if pd.notna(eos) else np.nan,
         "is_post_eos": bool(pd.notna(eos) and eos < TODAY),
-        "total_tickets": len(g_t),
-        "impact_1": int((g_t[t_impact] == 1).sum()),
-        "impact_2": int((g_t[t_impact] == 2).sum()),
-        "impact_3": int((g_t[t_impact] == 3).sum()),
-        "impact_4": int((g_t[t_impact] == 4).sum()),
-        "mean_impact": g_t[t_impact].mean() if len(g_t) else np.nan,
+        "total_tickets": len(g),
+        "impact_2": int((g["impact_int"] == 2).sum()) if len(g) else 0,
+        "impact_3": int((g["impact_int"] == 3).sum()) if len(g) else 0,
+        "impact_4": int((g["impact_int"] == 4).sum()) if len(g) else 0,
+        "impact_5": int((g["impact_int"] == 5).sum()) if len(g) else 0,
+        "mean_impact": g["impact_int"].mean() if len(g) else np.nan,
     })
-test6 = pd.DataFrame(per_prod_rows)
+test6 = pd.DataFrame(per_rows).sort_values("total_tickets", ascending=False)
 
-
-# ---------------------------------------------------------------------------
-# Diagnostics — join cardinality (helps spot runaway fan-out)
-# ---------------------------------------------------------------------------
-match_per_product = (joined.groupby("_join_key")[t_number]
-                     .apply(lambda s: s.notna().sum()))
-diag = pd.DataFrame({
-    "metric": [
-        "product_rows",
-        "ticket_rows",
-        "joined_rows",
-        "products_with_at_least_1_ticket_match",
-        "products_with_0_ticket_matches",
-        "max_tickets_matched_to_one_product",
-        "mean_tickets_per_matched_product",
-    ],
-    "value": [
-        len(products),
-        len(tickets),
-        len(joined),
-        int((match_per_product > 0).sum()),
-        int((match_per_product == 0).sum()),
-        int(match_per_product.max()) if len(match_per_product) else 0,
-        float(match_per_product[match_per_product > 0].mean())
-            if (match_per_product > 0).any() else 0.0,
-    ],
-})
-print("\nJoin diagnostics:")
-print(diag.to_string(index=False))
 
 # ---------------------------------------------------------------------------
 # Write output
-#
-# The joined frame exceeds Excel's 1,048,576-row limit, so:
-#   - full joined data -> CSV (unbounded)
-#   - Excel workbook -> all aggregate tests + a capped preview of joined data
 # ---------------------------------------------------------------------------
-joined_export = joined.drop(columns=["_join_key"])
-JOINED_CSV = OUTPUT_FILE.replace(".xlsx", "_joined_full.csv")
-
-print(f"\nWriting full joined data -> {JOINED_CSV} ({len(joined_export):,} rows)...")
-joined_export.to_csv(JOINED_CSV, index=False)
-
-EXCEL_ROW_LIMIT = 1_048_575  # minus header row
-preview = joined_export.head(EXCEL_ROW_LIMIT)
-
 print(f"Writing {OUTPUT_FILE}...")
 with pd.ExcelWriter(OUTPUT_FILE, engine="openpyxl") as xw:
-    # Aggregate results first (these are what you actually analyse)
-    diag.to_excel(xw,  sheet_name="0_join_diagnostics", index=False)
-    test1.to_excel(xw, sheet_name="1_aging_x_CTDR_TDR", index=False)
-    test2.to_excel(xw, sheet_name="2_total_tickets",    index=False)
-    test3.to_excel(xw, sheet_name="3_by_impact",        index=False)
-    test4.to_excel(xw, sheet_name="4_monthly_avg",      index=False)
+    diag.to_excel(xw,  sheet_name="0_diagnostics",       index=False)
+    test1.to_excel(xw, sheet_name="1_aging_x_CTDR_TDR",  index=False)
+    test2.to_excel(xw, sheet_name="2_total_tickets",     index=False)
+    test3.to_excel(xw, sheet_name="3_by_impact",         index=False)
+    test4.to_excel(xw, sheet_name="4_monthly_avg",       index=False)
     test5.to_excel(xw, sheet_name="5_monthly_by_impact", index=False)
-    test6.to_excel(xw, sheet_name="6_per_product_eos",  index=False)
-
-    # Per-product rate detail
+    test6.to_excel(xw, sheet_name="6_per_service_eos",   index=False)
     pre_all.to_excel(xw,  sheet_name="detail_pre_EOS_rates",  index=False)
     post_all.to_excel(xw, sheet_name="detail_post_EOS_rates", index=False)
-
-    # Joined-data preview last (capped at Excel's row limit)
-    preview.to_excel(xw, sheet_name="joined_data_preview", index=False)
-    if len(joined_export) > len(preview):
-        pd.DataFrame({"note": [
-            f"joined_data_preview shows the first {len(preview):,} rows.",
-            f"Full {len(joined_export):,} rows are in {JOINED_CSV}.",
-        ]}).to_excel(xw, sheet_name="_README", index=False)
+    (jt.drop(columns=["_key"])
+       .to_excel(xw, sheet_name="joined_tickets", index=False))
 
 print("\nDone.")
-print(f"  Excel:       {OUTPUT_FILE}")
-print(f"  Full joined: {JOINED_CSV}")
+print(f"  Output: {OUTPUT_FILE}")
 print("Run the dashboard with:  streamlit run app.py")
