@@ -1,3 +1,10 @@
-streamlit>=1.30
-pandas>=2.0
-openpyxl>=3.1
+few modifications:
+1. planned_audits.xlsx has only 1 sheet for all
+2. leave_tracker.xlsx has this new format - it is in a calendar format now - column name has
+3. interests.xlsx has the following format
+SL No	Audit Team	Audit Name	Start Date	End Date	Preference 1	Preference 2	Preference 3
+where under each Preference column there could be a bunch of Auditor names separated by columns.
+4. if an audit starts on say 1st march, and ends on 25th June, all 4 team member cannot be completely blocked from the dates 1st march-25th June. the TL must be booked the entire time, but the others can start a week or two prior, etc. They must be flexible. this is because, audit days and calendar days aren't equal. 1 week is approx.= 3 audit days
+5. we will be using this assistant to schedule audits for H2 2026. so we must also consider H1 allocations - i will providing another input file called h1_allocations.xlsx which will contain the same calendar type schedule (format is same as the one output by the aps_scheduler code you've written)
+6. i will be hosting the app on streamlit cloud - incorporate streamlit secrets and remove any 'os' dependency
+7. one person cannot be a part of 2 audits simultaneously
