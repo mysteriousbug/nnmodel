@@ -1,121 +1,77 @@
 """
-Login Page Checker
-------------------
-Reads URLs from an Excel file, checks each URL (and common login paths)
-for the presence of a login page, and writes a flagged Excel output.
+Login Page Checker v2
+---------------------
+Reads URLs from an Excel file and checks for login pages using a 3-step strategy:
+
+  1. If URL already ends in /login (or similar), check it directly for username/password fields.
+  2. If not, append /login and check there.
+  3. If neither yields a login form, scrape the original page (incl. nav menus, footers,
+     buttons) for any link or button labeled login / sign in / sign up / register / etc.
+     If found, follow it and check that destination for username/password fields.
+
+Uses Playwright (headless Chromium) so JS-rendered forms and nav menus are visible.
 
 Usage:
-    python login_page_checker.py input.xlsx output.xlsx [--url-column URL]
-
-Detection logic:
-    1. Fetches the original URL.
-    2. Fetches common login paths on the same domain (/login, /signin, etc.).
-    3. Flags a page as a "login page" if it contains login-form indicators:
-       - <input type="password">
-       - login/signin form action attributes
-       - keywords like "sign in", "log in", "username", "password" near a form
+    pip install pandas openpyxl playwright
+    playwright install chromium
+    python login_page_checker.py input.xlsx output.xlsx [--url-column URL] [--workers 5]
 """
 
 import argparse
+import asyncio
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, asdict
+from typing import Optional
 from urllib.parse import urljoin, urlparse
 
 import pandas as pd
-import requests
-from bs4 import BeautifulSoup
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from playwright.async_api import async_playwright, Browser, TimeoutError as PWTimeout
 
 # ---- Config ---------------------------------------------------------------
 
-COMMON_LOGIN_PATHS = [
-    "/login", "/signin", "/sign-in", "/log-in",
-    "/account/login", "/user/login", "/users/sign_in",
-    "/auth/login", "/auth/signin", "/wp-login.php",
-    "/admin", "/admin/login", "/portal/login",
-]
+PAGE_TIMEOUT_MS = 15000
+NAV_WAIT_MS = 2500  # extra wait after navigation for JS to render
 
-LOGIN_KEYWORDS = re.compile(
-    r"\b(sign[\s-]?in|log[\s-]?in|username|user\s*id|email\s*address|password)\b",
+LOGIN_PATH_PATTERN = re.compile(
+    r"/(login|signin|sign-in|log-in|signup|sign-up|register|auth|sso|account/login)/?$",
     re.IGNORECASE,
 )
 
-REQUEST_TIMEOUT = 10  # seconds
-MAX_WORKERS = 10
-USER_AGENT = (
-    "Mozilla/5.0 (compatible; LoginPageChecker/1.0; +https://example.local)"
+LOGIN_LINK_TEXT = re.compile(
+    r"\b(log[\s-]?in|sign[\s-]?in|sign[\s-]?up|register|create\s+account|"
+    r"my\s+account|member\s+login|customer\s+login|join\s+now)\b",
+    re.IGNORECASE,
 )
 
-# ---- HTTP session with retries -------------------------------------------
+LOGIN_HREF_PATTERN = re.compile(
+    r"(login|signin|sign-in|log-in|signup|sign-up|register|auth|sso)",
+    re.IGNORECASE,
+)
 
-def make_session() -> requests.Session:
-    session = requests.Session()
-    retry = Retry(
-        total=2,
-        backoff_factor=0.3,
-        status_forcelist=(500, 502, 503, 504),
-        allowed_methods=("GET", "HEAD"),
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-    session.headers.update({"User-Agent": USER_AGENT})
-    return session
+USERNAME_PATTERN = re.compile(
+    r"(user(name)?|email|e-mail|mobile|phone|login|userid|user_id|account)",
+    re.IGNORECASE,
+)
 
-
-# ---- Detection -----------------------------------------------------------
-
-def page_has_login(html: str) -> tuple[bool, list[str]]:
-    """Return (is_login_page, reasons)."""
-    reasons = []
-    if not html:
-        return False, reasons
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1. Password field is the strongest signal.
-    if soup.find("input", {"type": "password"}):
-        reasons.append("password field")
-
-    # 2. Form action that looks like login.
-    for form in soup.find_all("form"):
-        action = (form.get("action") or "").lower()
-        form_id = (form.get("id") or "").lower()
-        form_class = " ".join(form.get("class") or []).lower()
-        if any(k in action for k in ("login", "signin", "sign-in", "auth")):
-            reasons.append(f"form action: {action}")
-            break
-        if any(k in (form_id + " " + form_class) for k in ("login", "signin")):
-            reasons.append(f"form id/class: {form_id or form_class}")
-            break
-
-    # 3. Page text mentions login + has any form.
-    if not reasons and soup.find("form"):
-        text = soup.get_text(" ", strip=True)[:5000]
-        if LOGIN_KEYWORDS.search(text):
-            reasons.append("login keywords near form")
-
-    # 4. <title> says login/sign in
-    title_tag = soup.find("title")
-    if title_tag and LOGIN_KEYWORDS.search(title_tag.get_text() or ""):
-        if "login keywords near form" not in reasons:
-            reasons.append(f"title: {title_tag.get_text(strip=True)[:60]}")
-
-    return bool(reasons), reasons
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
-def fetch(session: requests.Session, url: str) -> tuple[int | None, str, str | None]:
-    """Return (status_code, html, error)."""
-    try:
-        r = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
-        return r.status_code, r.text, None
-    except requests.RequestException as e:
-        return None, "", str(e)
+@dataclass
+class CheckResult:
+    url: str
+    has_login: bool = False
+    login_url_found: str = ""
+    detection_method: str = ""
+    detection_reasons: str = ""
+    status_code: str = ""
+    error: str = ""
 
 
 def normalize_url(url: str) -> str:
@@ -127,81 +83,244 @@ def normalize_url(url: str) -> str:
     return url
 
 
-def check_url(session: requests.Session, raw_url: str) -> dict:
-    """Check the URL itself + common login paths."""
-    result = {
-        "url": raw_url,
-        "has_login": False,
-        "login_url_found": "",
-        "status_code": "",
-        "detection_reasons": "",
-        "error": "",
-    }
+def url_looks_like_login(url: str) -> bool:
+    path = urlparse(url).path or ""
+    return bool(LOGIN_PATH_PATTERN.search(path))
 
+
+def append_login(url: str) -> str:
+    parsed = urlparse(url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    return base.rstrip("/") + "/login"
+
+
+async def page_has_password_and_username(page) -> tuple[bool, list[str]]:
+    """Look for a password field + paired username-like field. Returns (is_login, reasons)."""
+    reasons = []
+
+    pwd_count = await page.locator('input[type="password"]').count()
+    if pwd_count == 0:
+        return False, reasons
+    reasons.append(f"{pwd_count} password field(s)")
+
+    username_found = False
+    candidates = await page.locator(
+        'input[type="email"], input[type="tel"], input[type="text"], '
+        'input:not([type]), input[type="number"]'
+    ).all()
+
+    for inp in candidates:
+        try:
+            attrs = await inp.evaluate(
+                """el => ({
+                    name: el.name || '',
+                    id: el.id || '',
+                    placeholder: el.placeholder || '',
+                    ariaLabel: el.getAttribute('aria-label') || '',
+                    autocomplete: el.autocomplete || '',
+                    type: el.type || ''
+                })"""
+            )
+        except Exception:
+            continue
+
+        blob = " ".join(str(v) for v in attrs.values())
+        if USERNAME_PATTERN.search(blob) or attrs.get("type") in ("email", "tel"):
+            username_found = True
+            label = attrs.get("name") or attrs.get("id") or attrs.get("placeholder") or attrs.get("type")
+            reasons.append(f"username-like field: {label[:40]}")
+            break
+
+    if not username_found:
+        try:
+            title = (await page.title()) or ""
+        except Exception:
+            title = ""
+        try:
+            body_text = await page.evaluate(
+                "() => document.body ? document.body.innerText.slice(0, 3000) : ''"
+            )
+        except Exception:
+            body_text = ""
+        text_blob = f"{title}\n{body_text}"
+        if re.search(r"\b(sign[\s-]?in|log[\s-]?in)\b", text_blob, re.IGNORECASE):
+            reasons.append("password field + login text on page")
+            return True, reasons
+        # Password field alone with no login context: likely a "change password" form. Reject.
+        return False, []
+
+    return True, reasons
+
+
+async def find_login_link_on_page(page) -> Optional[str]:
+    """Scrape every <a> and <button> (nav menus, footers, dropdowns) for a login link."""
+    try:
+        candidates = await page.evaluate(
+            """() => {
+                const out = [];
+                document.querySelectorAll('a').forEach(a => {
+                    out.push({
+                        kind: 'a',
+                        text: (a.innerText || a.textContent || '').trim(),
+                        aria: a.getAttribute('aria-label') || '',
+                        title: a.getAttribute('title') || '',
+                        href: a.href || ''
+                    });
+                });
+                document.querySelectorAll('button, [role="button"]').forEach(b => {
+                    out.push({
+                        kind: 'btn',
+                        text: (b.innerText || b.textContent || '').trim(),
+                        aria: b.getAttribute('aria-label') || '',
+                        title: b.getAttribute('title') || '',
+                        href: '',
+                        onclick: b.getAttribute('onclick') || ''
+                    });
+                });
+                return out;
+            }"""
+        )
+    except Exception:
+        return None
+
+    base_url = page.url
+
+    # Pass 1: anchors with login-ish text AND login-ish href
+    for c in candidates:
+        if c["kind"] != "a" or not c["href"]:
+            continue
+        label = f"{c['text']} {c['aria']} {c['title']}"
+        if LOGIN_LINK_TEXT.search(label) and LOGIN_HREF_PATTERN.search(c["href"]):
+            return urljoin(base_url, c["href"])
+
+    # Pass 2: anchors with login-ish text
+    for c in candidates:
+        if c["kind"] != "a" or not c["href"]:
+            continue
+        label = f"{c['text']} {c['aria']} {c['title']}"
+        if LOGIN_LINK_TEXT.search(label):
+            return urljoin(base_url, c["href"])
+
+    # Pass 3: anchors with login-ish href only
+    for c in candidates:
+        if c["kind"] != "a" or not c["href"]:
+            continue
+        if c["href"].startswith(("javascript:", "mailto:", "#")):
+            continue
+        if LOGIN_HREF_PATTERN.search(c["href"]):
+            return urljoin(base_url, c["href"])
+
+    return None
+
+
+async def goto_safe(page, url: str) -> tuple[bool, str, Optional[int]]:
+    try:
+        resp = await page.goto(url, timeout=PAGE_TIMEOUT_MS, wait_until="domcontentloaded")
+        await page.wait_for_timeout(NAV_WAIT_MS)
+        status = resp.status if resp else None
+        return True, "", status
+    except PWTimeout:
+        return False, "timeout", None
+    except Exception as e:
+        return False, str(e)[:200], None
+
+
+async def check_url(browser: Browser, raw_url: str) -> CheckResult:
+    result = CheckResult(url=raw_url)
     url = normalize_url(raw_url)
     if not url:
-        result["error"] = "empty url"
+        result.error = "empty url"
         return result
 
-    # 1. Check the URL as-is.
-    status, html, err = fetch(session, url)
-    if err:
-        result["error"] = err
-    result["status_code"] = status if status is not None else ""
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        ignore_https_errors=True,
+        viewport={"width": 1366, "height": 800},
+    )
+    page = await context.new_page()
 
-    if html:
-        is_login, reasons = page_has_login(html)
-        if is_login:
-            result["has_login"] = True
-            result["login_url_found"] = url
-            result["detection_reasons"] = "; ".join(reasons)
-            return result
+    try:
+        # Step 1: check the URL itself
+        ok, err, status = await goto_safe(page, url)
+        if status is not None:
+            result.status_code = str(status)
+        if not ok:
+            result.error = err
 
-    # 2. Check common login paths on the same origin.
-    parsed = urlparse(url)
-    if not parsed.netloc:
-        return result
-    base = f"{parsed.scheme}://{parsed.netloc}"
-
-    for path in COMMON_LOGIN_PATHS:
-        candidate = urljoin(base, path)
-        c_status, c_html, c_err = fetch(session, candidate)
-        if c_status and 200 <= c_status < 400 and c_html:
-            is_login, reasons = page_has_login(c_html)
+        if ok:
+            is_login, reasons = await page_has_password_and_username(page)
             if is_login:
-                result["has_login"] = True
-                result["login_url_found"] = candidate
-                result["status_code"] = c_status
-                result["detection_reasons"] = "; ".join(reasons)
+                result.has_login = True
+                result.login_url_found = page.url
+                result.detection_method = "direct" if url_looks_like_login(url) else "original-url"
+                result.detection_reasons = "; ".join(reasons)
                 return result
 
-    return result
+        # Step 2: append /login if not already a login URL
+        if not url_looks_like_login(url):
+            appended = append_login(url)
+            ok2, err2, status2 = await goto_safe(page, appended)
+            if ok2:
+                is_login, reasons = await page_has_password_and_username(page)
+                if is_login:
+                    result.has_login = True
+                    result.login_url_found = page.url
+                    result.detection_method = "appended"
+                    result.detection_reasons = "; ".join(reasons)
+                    if status2 is not None:
+                        result.status_code = str(status2)
+                    return result
+
+        # Step 3: go back to original, scrape for login link
+        ok3, err3, _ = await goto_safe(page, url)
+        if not ok3:
+            if not result.error:
+                result.error = err3
+            return result
+
+        login_link = await find_login_link_on_page(page)
+        if login_link:
+            ok4, err4, status4 = await goto_safe(page, login_link)
+            if ok4:
+                is_login, reasons = await page_has_password_and_username(page)
+                if is_login:
+                    result.has_login = True
+                    result.login_url_found = page.url
+                    result.detection_method = "nav-link"
+                    result.detection_reasons = "; ".join(reasons)
+                    if status4 is not None:
+                        result.status_code = str(status4)
+                    return result
+                else:
+                    result.detection_method = "nav-link-no-form"
+                    result.login_url_found = page.url
+                    result.detection_reasons = "found login-style link but no password field at destination"
+
+        if not result.detection_method:
+            result.detection_method = "none"
+        return result
+
+    finally:
+        await context.close()
 
 
-# ---- Excel I/O ------------------------------------------------------------
-
-def read_urls(path: str, url_column: str | None) -> tuple[pd.DataFrame, str]:
+def read_urls(path: str, url_column: Optional[str]) -> tuple[pd.DataFrame, str]:
     df = pd.read_excel(path)
     if url_column and url_column in df.columns:
         col = url_column
     else:
-        # auto-detect: first column containing "url" (case-insensitive), else first column
         matches = [c for c in df.columns if "url" in str(c).lower()]
         col = matches[0] if matches else df.columns[0]
     return df, col
 
 
-def write_output(df: pd.DataFrame, results: list[dict], url_col: str, out_path: str):
-    res_df = pd.DataFrame(results).rename(columns={"url": url_col})
-    # Merge results back onto original df on URL.
+def write_output(df: pd.DataFrame, results: list[CheckResult], url_col: str, out_path: str):
+    res_df = pd.DataFrame([asdict(r) for r in results]).rename(columns={"url": url_col})
     merged = df.merge(res_df, on=url_col, how="left", suffixes=("", "_check"))
-
     merged.to_excel(out_path, index=False)
 
-    # Highlight rows where has_login is True.
     wb = load_workbook(out_path)
     ws = wb.active
-
     headers = [c.value for c in ws[1]]
     try:
         flag_col_idx = headers.index("has_login") + 1
@@ -220,7 +339,6 @@ def write_output(df: pd.DataFrame, results: list[dict], url_col: str, out_path: 
             for c in row:
                 c.fill = yellow
 
-    # Auto-ish column widths
     for col_cells in ws.columns:
         length = max((len(str(c.value)) for c in col_cells if c.value is not None), default=10)
         ws.column_dimensions[col_cells[0].column_letter].width = min(length + 2, 60)
@@ -228,34 +346,46 @@ def write_output(df: pd.DataFrame, results: list[dict], url_col: str, out_path: 
     wb.save(out_path)
 
 
-# ---- Main -----------------------------------------------------------------
+async def run(urls: list[str], workers: int) -> list[CheckResult]:
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        sem = asyncio.Semaphore(workers)
+        total = len(urls)
+        done = 0
+        lock = asyncio.Lock()
+
+        async def worker(u: str):
+            nonlocal done
+            async with sem:
+                res = await check_url(browser, u)
+                async with lock:
+                    done += 1
+                    flag = "LOGIN" if res.has_login else "—"
+                    print(f"[{done}/{total}] {flag:5s} ({res.detection_method or 'n/a'}) {u}")
+                return res
+
+        results = await asyncio.gather(*[worker(u) for u in urls])
+        await browser.close()
+    return results
+
 
 def main():
-    parser = argparse.ArgumentParser(description="Check URLs for login pages.")
+    parser = argparse.ArgumentParser(description="Check URLs for login pages (Playwright).")
     parser.add_argument("input", help="Input .xlsx file with URLs")
     parser.add_argument("output", help="Output .xlsx file")
-    parser.add_argument("--url-column", help="Name of the URL column (auto-detected if omitted)")
-    parser.add_argument("--workers", type=int, default=MAX_WORKERS)
+    parser.add_argument("--url-column", help="Name of URL column (auto-detected if omitted)")
+    parser.add_argument("--workers", type=int, default=5, help="Concurrent browsers (default 5)")
     args = parser.parse_args()
 
     df, url_col = read_urls(args.input, args.url_column)
-    print(f"Loaded {len(df)} rows. Using URL column: '{url_col}'")
-
     urls = df[url_col].dropna().astype(str).unique().tolist()
-    session = make_session()
+    print(f"Loaded {len(df)} rows. URL column: '{url_col}'. Checking {len(urls)} unique URLs.\n")
 
-    results: list[dict] = []
     start = time.time()
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(check_url, session, u): u for u in urls}
-        for i, fut in enumerate(as_completed(futures), 1):
-            res = fut.result()
-            results.append(res)
-            flag = "LOGIN" if res["has_login"] else "—"
-            print(f"[{i}/{len(urls)}] {flag:5s} {res['url']}")
-
+    results = asyncio.run(run(urls, args.workers))
     elapsed = time.time() - start
-    found = sum(1 for r in results if r["has_login"])
+
+    found = sum(1 for r in results if r.has_login)
     print(f"\nDone in {elapsed:.1f}s. Login pages found on {found}/{len(urls)} URLs.")
 
     write_output(df, results, url_col, args.output)
