@@ -1,3 +1,8 @@
-the main concern is that we cannot upload bank related sensitive information to the app - we need to store all data locally. in case i use local streamlit (localhost), where will the uploaded files be stored?
-if i use streamlit cloud, i still want all data to be stored locally, in my local SQLite, etc.
- also i dont think i can send data directly to groq. if using AI is absolutely necessary, then we must have data massaging layer too where we remove all PII and send only masked data. If using AI is not necessary, then ok.
+these are the trainings planned for phase 1 for all the team members
+OWASP Top 10 for LLM Applications 2025
+MITRE ATLAS Framework
+NIST AI Risk Management Framework
+Google Secure AI Framework
+RAND Guide
+
+at the end of it, to evaluate, should we create a quiz or do you have better ideas?
