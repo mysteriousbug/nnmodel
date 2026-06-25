@@ -1,8 +1,78 @@
-these are the trainings planned for phase 1 for all the team members
-OWASP Top 10 for LLM Applications 2025
-MITRE ATLAS Framework
-NIST AI Risk Management Framework
-Google Secure AI Framework
-RAND Guide
+## SLIDE 1 — Problem, Dataset & Solution
 
-at the end of it, to evaluate, should we create a quiz or do you have better ideas?
+**Header:** URL Security Checker | Problem · Dataset · Solution
+
+---
+
+**PROBLEM STATEMENT**
+
+Manual verification of approved website lists is time-intensive, inconsistent across reviewers, and not scalable for audit engagements involving large URL populations. Without a standardised approach, testing quality varies and audit evidence lacks the rigour required for full population coverage.
+
+---
+
+**DATASET**
+
+**Input:** Excel file (.xlsx) containing IT-approved whitelist URLs
+**Population:** ~100 URLs per audit engagement
+**Output:** Structured Excel report — availability status, detection outcome, evidence trail, and error log per URL
+
+---
+
+**SOLUTION — 3-PHASE DETECTION ENGINE**
+
+**01 — Availability Scanning**
+Establishes reachability and connectivity for each URL. Executes concurrently across the full population, with automated timeout handling, retry logic, and SSL/TLS verification to ensure reliable and consistent results.
+
+**02 — Form & Endpoint Discovery**
+Systematically identifies functional components of each website — including file upload interfaces, download mechanisms, and data submission endpoints — to assess the site's data transfer capabilities.
+
+**03 — Login Page Detection**
+Conducts structured authentication control verification. Checks each URL directly for login forms, tests standardised login path variants, and performs navigation-level scraping to identify sign-in entry points not visible at the surface level.
+
+*Technology Stack: Python · requests · threading · selenium · openpyxl*
+
+---
+---
+
+## SLIDE 2 — Usage, Impact & Applications
+
+**Header:** URL Security Checker | Usage · Impact · Audit Applications
+
+---
+
+**HOW TO RUN**
+```
+pip install pandas openpyxl requests beautifulsoup4 selenium
+python url_checker.py  input.xlsx  output.xlsx  --workers 5
+```
+
+---
+
+**IMPACT OF AUTOMATION**
+
+| | |
+|---|---|
+| **~30 hrs** of manual testing effort eliminated per engagement | **100%** population coverage achieved — no sampling required |
+| **Minutes** to complete what previously required days | **Configurable** across audit objectives with minimal modification |
+
+---
+
+**AUDIT APPLICATIONS**
+
+**🔐 Centralised Authentication Audit (2026)**
+Phase 3 deployed to assess authentication control presence across ~100 IT-approved URLs. The script identified portals operating without login controls, producing URL-level evidence directly supporting control gap findings in the audit workpaper.
+
+**🛡 Data Leakage Protection Audit (2025-GT-AU3002348)**
+Phase 2 deployed to assess data exfiltration risk across the same URL population. The script systematically identified upload forms and download mechanisms on whitelisted sites, with output delivered as a risk-stratified findings report for workpaper attachment.
+
+---
+
+*The script was configured differently for each engagement — same codebase, adapted scope — demonstrating its flexibility as a reusable audit automation asset.*
+
+---
+
+> **Changes made:**
+> - Language elevated throughout — passive constructions, formal phrasing, audit terminology where appropriate
+> - "Reads the page like a human" and similar informal lines replaced with precise, professional descriptions
+> - Application cards reframed around audit outcomes and evidence, not just what the script did
+> - Closing tagline formalised to position the tool as a reusable audit asset
