@@ -1,0 +1,92 @@
+Here's how to walk a stakeholder through it in ~5 minutes. I'll give you the script, then the visuals you can pull up.
+
+## The 60-second pitch
+
+"This tool takes our 5 planning inputs — leaves, skills, planned audits, prior assignments, and interest forms — and produces a year-long audit schedule with team assignments. It picks a Team Lead and 3 members for each audit by scoring every auditor on four dimensions: skill match, prior domain experience, availability around their leaves, and whether they asked for that audit. The output is a weekly grid in the same format we already use, plus a per-audit summary and a warnings file flagging anything the scheduler couldn't fully solve."
+
+## The 5-step logic walkthrough
+
+**Step 1 — Build a unified auditor pool.**
+We read all three team sheets from each workbook and merge into one pool of 18 auditors, each tagged with their home team, role (SAM/AM/Co-Source), skills, certifications, leave windows, preferences, and prior audit history. This lets us pull cross-team — an ICS auditor can still serve on a T&A-led audit.
+
+**Step 2 — Compute audit windows.**
+Each audit has total auditor-days and a report-issuance date. We divide total days by 4 (the team size) to get fieldwork duration, then work backward from the report date, leaving 5 working days as a reporting buffer. So a 130-day audit with report on 26 Jan runs ~32 working days, ending around 19 Jan.
+
+**Step 3 — Split days across the three teams.**
+Base split is 50/30/20 — primary team gets half, second and third teams split the rest. Three adjustments on top:
+- Analytics flagged → DM gets +10%
+- Infra/cloud/network in the title → T&A gets +5%
+- Security/IAM/PAM/red-team in the title → ICS gets +5%
+- Floor of 15% per team so no one gets squeezed out
+
+So PAM (ICS primary, analytics yes, security keywords) ends up 88/32/40 — ICS dominant, with bumps for both analytics and security. AWS (T&A primary, no analytics, infra keywords) is 32/72/26 — T&A heavily weighted, ICS gets the secondary slice.
+
+**Step 4 — Score every auditor for every audit.**
+Weighted score on four factors:
+
+| Factor | Weight | How it's computed |
+|---|---|---|
+| Skill match | 35% | Jaccard overlap between auditor's skills and skills inferred from the audit title by Llama 3.3 70B (via Groq), plus a bonus for matching certifications |
+| Prior domain experience | 30% | Token overlap between this audit's title and the auditor's prior audits — so last year's "AWS Pooled Audit 2025" matches this year's "AWS Pooled Audit" |
+| Availability | 20% | Percentage of the audit window when the auditor is not on leave |
+| Interest | 15% | 1.0 if the audit is in their preference list, else 0 |
+
+Skill inference is the only LLM-powered step. Everything else is deterministic.
+
+**Step 5 — Greedy assignment, earliest report date first.**
+For each audit (sorted by report deadline):
+1. Pick the Team Lead — highest-scoring SAM in the primary team with at least 60% availability. If the planning sheet already names a Team Lead and that person is available, we honour it.
+2. Fill remaining seats team-by-team. For each team, take the top N by score, where N comes from the per-team headcount we computed in step 3.
+3. Add a +0.5 bonus to auditors whose preference hasn't been satisfied yet — this is what guarantees most people get at least one of their three preferred audits.
+4. Small workload penalty so the same auditor doesn't get stacked.
+
+If a team is too SAM-poor to lead its audits, or an audit's window has too many people on leave, those flow into the warnings file — partial solve, not a hard fail.
+
+## Concrete examples to show on screen
+
+Pull up `assignments_summary.xlsx` and walk through three rows:
+
+**Row 4 — PAM Audit (2026-GT-004), Primary: ICS**
+- TL: Mo Patel (ICS SAM, prior PAM 2025 experience)
+- Members: Ananya Krishnan (ICS — has PAM/Vault skills), Aisha Khan (T&A — network), Farah Ahmed (DM — Python/audit automation)
+- Split 88/32/40: ICS got the analytics + security double-bump
+- Talking point: *"Mo was the natural TL — he led PAM last year. Ananya gets pulled in because she has explicit PAM skills and PAM is one of her preferences."*
+
+**Row 1 — AWS Pooled Audit (2026-GT-001), Primary: T&A**
+- TL: Sandra Lim (T&A SAM, AWS/cloud skills, led AWS in 2025)
+- Members: Mo Patel (ICS), Meera Pillai (T&A — has AWS skills), Deepak Rao (DM)
+- Split 32/72/26: T&A primary plus infra-keyword bump
+- Talking point: *"Sandra is the obvious TL — she scored highest on every dimension: cloud skills, prior AWS work, available, AWS was her top preference. The system also pulls Meera in from T&A because she has AWS skills, and Deepak from DM for the data-side scope."*
+
+**Row 12 — AI Factory & LLM Red-Teaming (2026-GT-012), Primary: ICS**
+- TL: Mo Patel (led AI Factory red-teaming in 2025)
+- Members: Ananya Krishnan (ICS — has LLM Security skills), Meera Pillai (T&A — cloud), Farah Ahmed (DM — LLM skills)
+- Talking point: *"This is where the prior-experience signal matters most. Mo and Ananya both worked on AI Factory red-teaming last year — the system surfaced them automatically."*
+
+## If they ask "How do you know it's right?"
+
+Two checks worth showing:
+
+1. **Workload tab in `warnings.xlsx`** — shows days booked per auditor and whether their preference was met. Currently 100% of auditors with preferences got at least one. Days are reasonably spread (65 to 150 across 18 people for a 12-audit year).
+
+2. **No warnings on this run.** Real data will produce warnings — that's the point. A warning isn't a failure; it's a flag for human judgment (e.g., *"this audit has only 2 candidates in T&A when it needed 3, please reallocate"*).
+
+## If they ask "What are the limits?"
+
+Be direct about three things:
+
+1. **Greedy, not optimal.** Audits scheduled earliest get first pick of auditors. A globally optimal assignment would need a constraint solver (~10x more complex). For 18 auditors / 12 audits this doesn't matter; if we scale to 100+ audits we'd revisit.
+
+2. **Skill inference depends on the LLM.** If Groq returns vague tags, scores drop. We mitigate this with a keyword fallback and a cache so results are reproducible run-to-run.
+
+3. **Prior-experience matching is text-based.** If an audit gets renamed completely (e.g., "AWS Audit" → "Hyperscaler Cloud Review"), the link to prior history breaks. We'd add an explicit `audit_lineage` column to fix that.
+
+## One demo flow that works
+
+1. Open `assignments_summary.xlsx` first — it's the headline output.
+2. Pick one row (PAM is a good one) and explain why those four people got picked.
+3. Switch to `assignments_grid.xlsx` — show that the same assignments are now visualised week-by-week in the format the team already uses.
+4. Switch to `warnings.xlsx` → Auditor Workload tab — show preference satisfaction and days-booked distribution.
+5. Close on: *"Today this took ~8 seconds end-to-end. Same logic, real data, plug Groq in, and we have a first-pass schedule humans can review and adjust."*
+
+Good luck — ping me if any specific question gets thrown at you and I'll give you the technical answer.
